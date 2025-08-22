@@ -5,26 +5,26 @@
 cooccurrence_graph_mecab_plotly.py
 
 - SQLite (files/pages) からテキスト取得
-- MeCab で分かち書き & 品詞フィルタ（IPADIC / UniDic の両対応）
-- スライディングウィンドウ共起を集計
-- NetworkX でグラフ化し、Plotly でインタラクティブ可視化 (HTML)
+- MeCab で分かち書き & 品詞フィルタ（IPADIC / UniDic 両対応）
+- 共起集計: unit={page|sentence|file} + スライディング窓
+- Plotly でインタラクティブ可視化 (HTML)
 
 依存:
   pip install mecab-python3 plotly networkx pandas tqdm
 """
 
 import argparse
+import re
 import sqlite3
 from pathlib import Path
-from typing import Iterable, List, Tuple, Set, Dict
-from collections import Counter
+from typing import Iterable, List, Tuple, Set
+from collections import Counter, defaultdict
 
 import pandas as pd
 import networkx as nx
 from tqdm import tqdm
 import plotly.graph_objects as go
 
-# ---- MeCab ----
 import MeCab
 
 # ------------------------------
@@ -37,7 +37,8 @@ JOIN files f ON f.id = p.file_id
 WHERE 1=1
 """
 
-def fetch_pages(conn: sqlite3.Connection, name_like: str = None, only_ext: str = None) -> Iterable[Tuple[int,int,str,str,str]]:
+def fetch_pages(conn: sqlite3.Connection, name_like: str = None, only_ext: str = None
+               ) -> Iterable[Tuple[int,int,str,str,str]]:
     query = SQL_BASE
     params = []
     if name_like:
@@ -63,28 +64,45 @@ def load_stopwords(path: Path) -> Set[str]:
     return {w.strip() for w in p.read_text(encoding="utf-8").splitlines() if w.strip()}
 
 # ------------------------------
+# 文分割（日本語フレンドリーな簡易版）
+# ------------------------------
+_SENT_SPLIT_RE = re.compile(
+    r"""            # 句点類/感嘆/疑問/ピリオド/改行の繰返しで区切る
+    (?<=。|！|？|!|\?)
+    |[\r\n]+
+    """,
+    re.VERBOSE
+)
+
+def split_sentences(text: str) -> List[str]:
+    # まず改行正規化
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    # 分割
+    parts = _SENT_SPLIT_RE.split(t)
+    # 連結: splitは区切りトークンも含む可能性があるため、空白を綺麗に
+    sents = []
+    buf = []
+    for p in parts:
+        if p is None:
+            continue
+        p = p.strip()
+        if not p:
+            continue
+        sents.append(p)
+    return sents
+
+# ------------------------------
 # MeCab 形態素解析 & 品詞フィルタ
 # ------------------------------
 def _guess_pos_from_feature(feature: str) -> str:
-    """
-    MeCabの feature（CSV）から先頭品詞名を返す。
-    - IPADIC: 品詞, 品詞細分類1, 品詞細分類2, 品詞細分類3, 活用形, 活用型, 原形, 読み, 発音
-    - UniDic: pos, pos1, pos2, pos3, cType, cForm, lForm, lemma, orth, pron, ...
-    どちらも先頭要素が「品詞」カテゴリのトップなので、split(',')[0] を採用。
-    """
     if not feature:
         return ""
-    return feature.split(",")[0]
+    return feature.split(",")[0]  # IPADIC/UniDicとも先頭が大分類
 
 def tokenize_mecab(text: str, tagger: MeCab.Tagger,
                    allowed_pos_prefixes: Set[str],
                    stopwords: Set[str]) -> List[str]:
-    """
-    allowed_pos_prefixes: {"名詞","動詞","形容詞"} など
-    """
     tokens: List[str] = []
-    # Tagger.parse で lattice を文字列として受け取り、1行ずつ解析
-    # 形式: "表層\tfeature\n"
     node_str = tagger.parse(text)
     if not node_str:
         return tokens
@@ -92,13 +110,11 @@ def tokenize_mecab(text: str, tagger: MeCab.Tagger,
         if line == "EOS" or not line.strip():
             continue
         if "\t" not in line:
-            # 辞書や改行の都合で \t が無い行が混ざる場合はスキップ
             continue
         surface, feature = line.split("\t", 1)
         surface = surface.strip()
         if not surface:
             continue
-
         pos = _guess_pos_from_feature(feature)
         if allowed_pos_prefixes and not any(pos.startswith(pfx) for pfx in allowed_pos_prefixes):
             continue
@@ -110,13 +126,15 @@ def tokenize_mecab(text: str, tagger: MeCab.Tagger,
 # ------------------------------
 # 共起カウント
 # ------------------------------
-def cooccurrence_pages(
-    pages_tokens: Iterable[List[str]],
-    window: int = 2
-) -> Tuple[Counter, Counter]:
+def cooccurrence_sequences(seqs: Iterable[List[str]], window: int = 2
+                          ) -> Tuple[Counter, Counter]:
+    """
+    seqs: トークン列のイテレータ（1ページ、1文、1ファイルなど任意の単位）
+    window: スライディング窓（右側 j < i+window）
+    """
     token_freqs = Counter()
     pair_freqs = Counter()
-    for tokens in pages_tokens:
+    for tokens in seqs:
         token_freqs.update(tokens)
         n = len(tokens)
         if n <= 1:
@@ -135,13 +153,9 @@ def cooccurrence_pages(
     return token_freqs, pair_freqs
 
 # ------------------------------
-# グラフ構築
+# グラフ構築 & 可視化
 # ------------------------------
-def build_graph(
-    token_freqs: Counter,
-    pair_freqs: Counter,
-    min_freq: int = 1
-) -> nx.Graph:
+def build_graph(token_freqs: Counter, pair_freqs: Counter, min_freq: int = 1) -> nx.Graph:
     G = nx.Graph()
     for token, freq in token_freqs.items():
         if freq >= min_freq:
@@ -151,80 +165,50 @@ def build_graph(
             G.add_edge(a, b, weight=w)
     return G
 
-# ------------------------------
-# Plotly 可視化（HTML）
-# ------------------------------
-def plot_graph_plotly(
-    G: nx.Graph,
-    out_html: Path,
-    seed: int = 42,
-    k_layout: float = None,
-    title: str = "Co-occurrence Network"
-) -> None:
+def plot_graph_plotly(G: nx.Graph, out_html: Path, seed: int = 42, k_layout: float = None,
+                      title: str = "Co-occurrence Network") -> None:
     if G.number_of_nodes() == 0:
         print("[WARN] Graph is empty; nothing to plot.")
         return
 
     pos = nx.spring_layout(G, seed=seed, k=k_layout)
 
-    # エッジ用トレース（線分）
-    edge_x = []
-    edge_y = []
-    edge_text = []
+    # edges
+    edge_x, edge_y = [], []
     for u, v, d in G.edges(data=True):
         x0, y0 = pos[u]
         x1, y1 = pos[v]
         edge_x += [x0, x1, None]
         edge_y += [y0, y1, None]
-        edge_text.append(f"{u} — {v}: {d.get('weight', 1)}")
-
     edge_trace = go.Scatter(
-        x=edge_x, y=edge_y,
-        line=dict(width=1),  # 色はデフォルト
-        hoverinfo='none',
-        mode='lines',
-        opacity=0.5
+        x=edge_x, y=edge_y, mode='lines',
+        line=dict(width=1), hoverinfo='none', opacity=0.5
     )
 
-    # ノード用トレース（散布図）
-    node_x = []
-    node_y = []
-    node_text = []
-    node_size = []
-    for node, d in G.nodes(data=True):
-        x, y = pos[node]
-        node_x.append(x)
-        node_y.append(y)
-        freq = d.get("freq", 1)
-        node_size.append(max(10, min(60, freq * 3)))  # サイズスケール
-        node_text.append(f"{node}<br>freq: {freq}")
-
+    # nodes
+    node_x, node_y, node_text, node_size = [], [], [], []
+    for n, d in G.nodes(data=True):
+        x, y = pos[n]
+        node_x.append(x); node_y.append(y)
+        f = d.get("freq", 1)
+        node_size.append(max(10, min(60, f * 3)))
+        node_text.append(f"{n}<br>freq: {f}")
     node_trace = go.Scatter(
         x=node_x, y=node_y,
         mode='markers+text',
         text=[n for n, _ in G.nodes(data=True)],
         textposition='top center',
-        marker=dict(
-            size=node_size,
-            line=dict(width=1)
-            # 色指定は行わない（デフォルトテーマ）
-        ),
-        hovertext=node_text,
-        hoverinfo='text'
+        marker=dict(size=node_size, line=dict(width=1)),
+        hovertext=node_text, hoverinfo='text'
     )
 
     fig = go.Figure(data=[edge_trace, node_trace])
     fig.update_layout(
-        title=title,
-        title_x=0.5,
-        showlegend=False,
+        title=title, title_x=0.5, showlegend=False,
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
         yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        margin=dict(l=20, r=20, t=50, b=20),
-        hovermode='closest'
+        margin=dict(l=20, r=20, t=50, b=20), hovermode='closest'
     )
-
-    # HTML として保存（自己完結）
     fig.write_html(str(out_html), include_plotlyjs='cdn', full_html=True)
     print(f"[OK] Saved interactive graph to: {out_html}")
 
@@ -232,18 +216,20 @@ def plot_graph_plotly(
 # メイン
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Build interactive co-occurrence network (MeCab + Plotly) from SQLite (files/pages).")
+    ap = argparse.ArgumentParser(description="Interactive co-occurrence (MeCab + Plotly) from SQLite, unit={page|sentence|file}.")
     ap.add_argument("--db", required=True, type=Path, help="SQLite path (with files/pages)")
-    ap.add_argument("--name_like", type=str, default=None, help="Filter by files.name LIKE pattern (e.g., %.pdf)")
+    ap.add_argument("--unit", choices=["page", "sentence", "file"], default="page",
+                    help="Co-occurrence unit: page (default), sentence, or file")
+    ap.add_argument("--name_like", type=str, default=None, help="Filter by files.name LIKE (e.g., %.pdf)")
     ap.add_argument("--only_ext", type=str, default=None, choices=["pdf","docx"], help="Filter by extension")
     ap.add_argument("--pos", nargs="+", default=["名詞"], help="Allowed POS prefixes (e.g., 名詞 動詞 形容詞)")
-    ap.add_argument("--window", type=int, default=2, help="Sliding window size for co-occurrence")
-    ap.add_argument("--min_freq", type=int, default=2, help="Min frequency for nodes/edges to keep")
+    ap.add_argument("--window", type=int, default=2, help="Sliding window size in each unit")
+    ap.add_argument("--min_freq", type=int, default=2, help="Min freq for nodes/edges to keep")
     ap.add_argument("--stopwords", type=Path, default=None, help="Stopwords file (one term per line)")
-    ap.add_argument("--output", type=Path, default=Path("./cooc.html"), help="Output HTML path for the graph")
-    ap.add_argument("--topn", type=int, default=50, help="Top-N co-occurrence pairs to export")
-    ap.add_argument("--top_csv", type=Path, default=None, help="If given, save top-N edges to CSV here")
-    ap.add_argument("--layout_k", type=float, default=None, help="spring_layout 'k' (node spacing). Try values like 0.8~1.5")
+    ap.add_argument("--output", type=Path, default=Path("./cooc.html"), help="Output HTML path")
+    ap.add_argument("--topn", type=int, default=50, help="Save top-N co-occurrence pairs")
+    ap.add_argument("--top_csv", type=Path, default=None, help="If given, write top-N pairs to CSV here")
+    ap.add_argument("--layout_k", type=float, default=None, help="spring_layout k (node spacing)")
     ap.add_argument("--seed", type=int, default=42, help="layout random seed")
     args = ap.parse_args()
 
@@ -253,20 +239,40 @@ def main():
         print("[INFO] No pages selected.")
         return
 
-    # MeCab 初期化（辞書指定が必要なら -d PATH を追加）
-    tagger = MeCab.Tagger("")  # ex) MeCab.Tagger("-d /usr/local/lib/mecab/dic/ipadic")
-
+    tagger = MeCab.Tagger("")  # 必要なら -d で辞書パス指定
     allowed_pos = set(args.pos)
     stopwords = load_stopwords(args.stopwords)
 
-    pages_tokens: List[List[str]] = []
-    for (_fid, _idx, text, _name, _ext) in tqdm(rows, desc="Tokenizing", unit="page"):
-        toks = tokenize_mecab(text or "", tagger, allowed_pos, stopwords)
-        pages_tokens.append(toks)
+    # ===== 単位ごとにトークン列を構築 =====
+    seqs: List[List[str]] = []
 
-    token_freqs, pair_freqs = cooccurrence_pages(pages_tokens, window=args.window)
+    if args.unit == "page":
+        # 各ページを1シーケンスとして扱う
+        for (_fid, _idx, text, _name, _ext) in tqdm(rows, desc="Tokenizing (page)", unit="page"):
+            toks = tokenize_mecab(text or "", tagger, allowed_pos, stopwords)
+            seqs.append(toks)
 
-    # 上位Nペアを書き出し（任意）
+    elif args.unit == "sentence":
+        # 各ページ → 文分割 → 各文を1シーケンス
+        for (_fid, _idx, text, _name, _ext) in tqdm(rows, desc="Sentence splitting + tokenizing", unit="page"):
+            sents = split_sentences(text or "")
+            for s in sents:
+                toks = tokenize_mecab(s, tagger, allowed_pos, stopwords)
+                if toks:
+                    seqs.append(toks)
+
+    elif args.unit == "file":
+        # 同一 file_id の全ページを連結して1シーケンス
+        by_file: defaultdict[int, List[str]] = defaultdict(list)
+        for (fid, _idx, text, _name, _ext) in rows:
+            if text:
+                by_file[fid].append(text)
+        for fid, chunks in tqdm(by_file.items(), desc="Tokenizing (file)", unit="file"):
+            toks = tokenize_mecab("\n".join(chunks), tagger, allowed_pos, stopwords)
+            seqs.append(toks)
+
+    token_freqs, pair_freqs = cooccurrence_sequences(seqs, window=args.window)
+
     if args.top_csv:
         df = pd.DataFrame(
             [(a, b, w) for (a, b), w in pair_freqs.most_common(args.topn)],
@@ -276,8 +282,8 @@ def main():
         print(f"[OK] Saved top-{args.topn} pairs to: {args.top_csv}")
 
     G = build_graph(token_freqs, pair_freqs, min_freq=args.min_freq)
-    plot_graph_plotly(G, args.output, seed=args.seed, k_layout=args.layout_k,
-                      title=f"Co-occurrence Network (pos={','.join(args.pos)}, window={args.window}, min_freq={args.min_freq})")
+    title = f"Co-occurrence Network (unit={args.unit}, pos={','.join(args.pos)}, window={args.window}, min_freq={args.min_freq})"
+    plot_graph_plotly(G, args.output, seed=args.seed, k_layout=args.layout_k, title=title)
 
 if __name__ == "__main__":
     main()
